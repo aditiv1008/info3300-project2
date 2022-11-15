@@ -1,0 +1,280 @@
+<html>
+
+<head>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+
+  <style>
+    .gridlines line {
+      stroke: #bbb;
+    }
+
+
+    .gridlines .domain {
+      stroke: none;
+
+    }
+  </style>
+</head>
+
+<body>
+
+  <p id="p2">
+    <svg id="choropleth" height="600" width="900" style="background: #445; margin-top:50px">
+
+    </svg>
+
+    <svg id="colorLegend" height="100" width="600" style="background: #fff; margin-top:30px">
+
+    </svg>
+    <script>
+      const svg = d3.select("#choropleth");
+      const width = svg.attr("width");
+      const height = svg.attr("height");
+      const margin = { top: 20, right: 20, bottom: 20, left: 20 };
+      const mapWidth = width - margin.left - margin.right;
+      const mapHeight = height - margin.top - margin.bottom;
+      const map = svg.append("g")
+        .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+      // 0. Let's explore a new way to use promises for data imports that might be a bit cleaner when importing lots of files
+
+      // First, create an anonymous function with the async keyword and assign it to a variable 
+      // This creates a function that returns a promise (meaning it is run `asynchronously`)
+      // Try leaving out the async -- you'll see the change in what line 81 prints
+      const testFunc = async function () {
+
+        return "Hello";
+
+      }
+      console.log(testFunc());
+
+      // We use async functions because they give access to *await* which can make code a lot easier to read
+      // See docs here: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/async_function
+
+      // * Start by making an anonymous async function which will contain most or all of your code *
+      // * Make sure to run the function after you make it (see bottom of file) *
+      // *** If it seems like nothing is happening, make sure you are running it ***
+      // * Then use await instead of .then()  -- see line 98
+
+      // 1. An async function to load data and build the map
+      const requestData = async function () {
+
+        // 2. Draw a map of US using topoJSON
+        // 2a. Import data as synchronous call to topoJSON data file
+        // Care of Mike Bostock:
+        //   "../datasets/us-smaller.json"
+        const us = await d3.json("../datasets/us-smaller.json");
+        console.log(us);
+
+        // 2b. Pick out topographic features and build d3 helpers
+        var states = topojson.feature(us, us.objects.states);     // List of state outlines to fill
+        var statesMesh = topojson.mesh(us, us.objects.states);    // 'Mesh' of all outlines put together for a stroke
+        var projection = d3.geoAlbersUsa().fitSize([mapWidth, mapHeight], states);
+        var path = d3.geoPath().projection(projection);
+        console.log(states);
+        console.log(statesMesh);
+
+        // We tried a few different projections, including:
+        //   .geoOrthographic()  .geoStereographic()   .geoMercator()
+
+
+        // 2d. Add a graticule (we did this after 2c, but it must go here)
+        //      (Graticules are much more configurable, but we'll use the default for now)
+        let graticule = d3.geoGraticule10();
+        console.log(graticule);
+        map.append("path").attr("class", "graticule").attr("d", path(graticule));
+
+
+        // 2c. Draw states and outlines (see CSS at the top)
+        let statePaths = map.selectAll("path.state").data(states.features)
+          .join("path")
+          .attr("class", "state")
+          .attr("note", d => d.id)  // debugging
+          .attr("d", path)
+          .on('mouseover', mouseEntersState)
+          .on('mouseout', mouseLeavesState);
+
+        map.append("path").datum(statesMesh)
+          .attr("class", "outline")
+          .attr("d", path);
+
+        // 3a. Import survey data as synchronous calls
+        // "../datasets/state-survey-responses-fa22.csv"
+
+        const surveyData = await d3.csv("HDI.csv", d3.autoType);
+        console.log(surveyData);
+
+
+        // 3b. Generate the data structures we will need
+        let stateIdCounts = {} // stateID => count #
+        let stateIdNames = {} // stateID => name of state
+        surveyData.forEach(row => {
+          stateIdCounts[row.state_code] = Number(row.total);
+          stateIdNames[row.state_code] = row.state_name;
+        });
+        console.log(stateIdCounts);
+
+        // 3c. Make a d3 color scale for frequency    
+        // Notice that stateIdCounts is a dictionary and not an array, which is usually what we send to d3.extent
+        // We're only interested in the values in that dictionary, so we can use a static helper function in Object to help
+        const minMax = d3.extent(Object.values(stateIdCounts));
+        console.log(minMax);
+
+        // This scale wasn't great because it crunched most of the points to the bottom 3rd of the color scale
+        //  3 state outliers with high values mean it is very distorted
+        // const colorScale = d3.scaleSequential(d3.interpolateBuPu).domain(minMax);
+
+        // Next, we try quantize, which splits the domain into bins
+        // In general, it splits it into as many bins as you provide items in the range
+
+        // const colorScale = d3.scaleQuantize()   // ZZZZZZZZZZZ
+        //                      .domain(minMax)
+        //                      .range(['rgb(160, 210, 232)','rgb(111, 166, 210)','rgb(37, 92, 214)','rgb(41, 19, 177)'])
+
+        // Finally, we use quantile, which looks at the points statistically
+        //  It will give weird results if you send minMax to the .domain(). Why?
+        //  ...because it needs to inspect *all of the values* in order to see the point *distribution*
+        //  we use Object.values() here to get all of the values out of the stateCounts dictionary
+
+        const colorScale = d3.scaleQuantile()      // LLLLLLLLL
+          .domain(Object.values(stateIdCounts))
+          .range(["#fff", "#d1e8ed", "#adc2da", "#8879b3", "#762b80"]);
+
+
+        // //  If you want to use a log scale instead of a linear quantile (which might work better):
+        // //   Here is one way to do this (note the use of Symlog because our domain includes 0)
+        // //   We create a new function that feeds the data value into a Symlog scale programmed to return 0 to 1
+        // //   It then routes the [0,1] value to interpolateGnBu, which returns a color, doing what we want
+        // //   Just like with normal scales, you feed them a data value and get back a color/pixel
+        // const colorScale = d => d3.interpolateGnBu( d3.scaleSymlog().domain(minMax).range([0,1])(d) );
+        // colorScale.domain = () => minMax;  // Hack to get legend working again because it uses scale.domain()
+        // // Another way to do this would be:
+        // const colorScale = d3.scaleLog().domain(minMax).interpolate(d => d3.interpolateGnBu)
+        // // Getting a scaleQuantile to work would be a bit trickier
+        // // You'll want to think about how to adjust the domain of the scale (hint: d3.map to transform data)
+        // //   and then also how you're going to show the values legend in the bottom scale
+
+
+        // 3d. Recolor the states to make a choropleth map
+        map.selectAll(".state")
+          .style("fill", d => colorScale(stateIdCounts[d.id]));
+
+        // 3e. Use the extra legend code to draw a legend
+        drawLegend("#colorLegend", colorScale);
+
+
+
+        // 4. Add a tooltip that "sticks" below the state
+        let tooltipWidth = 120;
+        let tooltipHeight = 40;
+
+
+        // At the end of lecture segment, I mentioned adding this code to do the mouseover outline the "proper" way
+        let momesh = map.append("path")
+          .attr("class", "mouseover outline")
+          .style("stroke", "black")
+          .style("stroke-width", 3)
+          .attr("d", "");
+
+        // Stub code to draw the tooltip - we use an SVG element here
+        // You can use an absolute-positioned HTML element, but the positioning requires some more work
+        // Instead, we make something centered at (0,0) and then later use translate() to move it
+        //  (this is why the x position for the rect is -tooltipWidth/2.0  -- so it's centered on 0 )
+        let tooltip = map.append("g")
+          .attr("class", "tooltip")
+          .attr("visibility", "hidden");
+        tooltip.append("rect")
+          .attr("fill", "black")
+          .attr("opacity", 0.9)
+          .attr("x", -tooltipWidth / 2.0)
+          .attr("y", 0)
+          .attr("width", tooltipWidth)
+          .attr("height", tooltipHeight)
+        let txt = tooltip.append("text")
+          .attr("fill", "white")
+          .attr("text-anchor", "middle")
+          .attr("alignment-baseline", "hanging")
+          .attr("x", 0)
+          .attr("y", 2);
+        let txt2 = tooltip.append("text")
+          .attr("fill", "white")
+          .attr("text-anchor", "middle")
+          .attr("alignment-baseline", "hanging")
+          .attr("x", 0)
+          .attr("y", 22);
+
+
+        function mouseEntersState() {
+          // Make tooltip visible
+          tooltip.style("visibility", "visible")
+
+          // Find the state SVG element and add stroke
+          let state = d3.select(this);
+
+          // // Original version before adding the bonus mesh after class
+          // state.attr("stroke","black")
+          //      .attr("stroke-width", 3);
+
+          // Using .datum() to recover the data for the state element (because we used a .join() to make it)...
+          // ... get the name of the state and count
+          let stateID = state.datum().id;
+
+          txt.text(stateIdNames[stateID]);
+          txt2.text(stateIdCounts[stateID]);
+
+          // You can use the geoPath() generator to do all sorts of helpful things 
+          // let [xPos, yPos] = path.centroid( state.datum() );  // Get the pixel "center" of the state
+
+          let bounds = path.bounds(state.datum());   // Get the pixel boundaries of the state
+          // In both cases here, the geoPath() is parsing the fancy topoJSON data to figure out pixels using the projection
+
+          // Place it at the bottom of the state, centered
+          let xPos = (bounds[0][0] + bounds[1][0]) / 2.0;
+          let yPos = bounds[1][1] - 15;
+
+          // Transform the <g> group so that everything moves together easily
+          tooltip.attr("transform", `translate(${xPos},${yPos})`);
+
+          // To fix the oscillation, we add this in the CSS for .mouseover
+          //  pointer-events: none;
+
+          // At the end of lecture segment, I mentioned adding this code to do the mouseover outline the "proper" way
+          // Technically, the right way to do this is with another mesh for some complicated reasons
+          //  You have to use the second parameter of topojson.mesh() to pick out this state's boundaries
+          // First, make a new mesh with a filter for only borders of the current state
+          var mo = topojson.mesh(us, us.objects.states, function (a, b) { return a.id === stateID || b.id === stateID; });
+          //  Then apply it to your special mesh that's on top of everything else (added earlier in this file)
+          momesh.datum(mo).attr("d", path)
+
+
+
+
+        }
+
+        function mouseLeavesState() {
+
+          // Hide when you leave a state
+          tooltip.style("visibility", "hidden");
+
+          let state = d3.select(this);
+
+          // Reset old style mouseover stroke
+          // state.attr("stroke","none")
+          //      .attr("stroke-width", 0);
+          // }
+
+          // Here we are hiding the mouseover mesh we added as bonus content
+          momesh.attr("d", "");
+
+        }
+
+        // END OF REQUESTDATA()
+      }
+      requestData();
+
+    </script>
+  </p>
+
+</body>
+
+</html>
